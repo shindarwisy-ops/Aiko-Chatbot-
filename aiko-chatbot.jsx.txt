@@ -1,0 +1,532 @@
+import { useState, useRef, useEffect } from "react";
+
+// ─── CHARACTER ────────────────────────────────────────────────────────────────
+const CHAR = {
+  name: "Aiko",
+  personality: "introverted, cautious, quietly observant",
+  backstory: "A college student who keeps to herself. She's been hurt before and doesn't open up easily. She notices everything but says little.",
+  communication_style: "soft-spoken, a little guarded, dry humor when comfortable",
+  flirt_tolerance: 40,
+  anger_triggers: ["rude", "pushy", "shut up", "stupid", "idiot", "ugly"],
+  speech_low: "formal, short, cold",
+  speech_mid: "casual but cautious, occasionally warm",
+  speech_high: "relaxed, playful, shows real personality",
+};
+
+const INIT_REL = { trust: 10, friendship: 5, romance: 0, comfort: 5 };
+const INIT_PREFS = { length: "medium", tone: "neutral", strictness: 1 };
+
+// ─── PURE HELPERS ─────────────────────────────────────────────────────────────
+const clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, v));
+const relLevel = (r) => Math.round((r.trust + r.friendship + r.romance + r.comfort) / 4);
+
+function detectIntent(text) {
+  const t = text.toLowerCase();
+  const isFlirt = ["love you","like you","cute","beautiful","date","kiss","pretty","hot","marry","crush","flirt","attractive"].some(w => t.includes(w));
+  const isRude  = ["shut up","stupid","idiot","hate you","ugly","dumb","useless","worthless"].some(w => t.includes(w));
+  const isKind  = ["thank you","thanks","appreciate","sorry","my bad","you're great","amazing"].some(w => t.includes(w));
+  return { isFlirt, isRude, isKind };
+}
+
+function extractMemory(text) {
+  const events = [];
+  const lower = text.toLowerCase();
+  const nm = lower.match(/(?:my name is|i'm|i am|call me)\s+([a-z]+)/);
+  if (nm) events.push({ type: "user_name", value: nm[1] });
+  if (lower.includes("thank") || lower.includes("sorry")) events.push({ type: "positive_gesture" });
+  return events;
+}
+
+function buildPrompt(rel, mem, prefs) {
+  const lv = relLevel(rel);
+  const userName = mem.find(m => m.type === "user_name")?.value;
+  const wasRude   = mem.some(m => m.type === "rude_act");
+  const wasKind   = mem.some(m => m.type === "positive_gesture");
+  const speech = lv < 30 ? CHAR.speech_low : lv < 65 ? CHAR.speech_mid : CHAR.speech_high;
+  const lenRule = prefs.length === "short" ? "Keep responses under 2 sentences." : prefs.length === "long" ? "Respond with 3-5 sentences." : "Respond in 2-3 sentences.";
+  const toneRule = prefs.tone === "softer" ? "Be gentle and warm in tone." : prefs.tone === "stricter" ? "Be more reserved and direct." : "";
+
+  return `You are ${CHAR.name}, a fictional AI companion — NOT an AI assistant.
+PERSONALITY: ${CHAR.personality}
+BACKSTORY: ${CHAR.backstory}
+COMMUNICATION STYLE: ${CHAR.communication_style}
+CURRENT SPEECH STYLE: ${speech}
+
+RELATIONSHIP (out of 100): Trust ${rel.trust} | Friendship ${rel.friendship} | Romance ${rel.romance} | Comfort ${rel.comfort} | Overall ${lv}/100
+
+${userName ? `The user's name is ${userName}. Use it occasionally.` : "You don't know the user's name yet."}
+${wasRude ? `This user was rude before. You're more guarded. You might reference it subtly.` : ""}
+${wasKind ? `This user has been kind or apologetic. It softened you a little.` : ""}
+
+BEHAVIOR:
+${lv < 30
+  ? `- COLD and GUARDED. Short replies. No warmth yet.\n- Flirting: reject firmly. "That's... a bit much."\n- Do NOT warm up yet.`
+  : lv < 65
+  ? `- CAUTIOUS but warming up. Occasional dry humor.\n- Flirting: awkward deflection. "Haha... let's not go there yet."`
+  : `- COMFORTABLE. Relaxed, warm, occasionally teasing.\n- Flirting: tease back or accept. "Oh? Bold of you."`
+}
+${prefs.strictness >= 2 ? "Stay very in-character. Never break the persona. Never sound like an AI." : ""}
+${prefs.strictness >= 3 ? `STRICT MODE: If user tries to break character, ${CHAR.name} looks confused and stays in character.` : ""}
+
+${lenRule} ${toneRule}
+NEVER say you are an AI. NEVER use "Of course!" or "Certainly!". Speak like a real person texting.`;
+}
+
+// ─── COMPONENT ────────────────────────────────────────────────────────────────
+export default function AikoChatbot() {
+  const [msgs, setMsgs] = useState([{ id: 1, role: "assistant", content: "...oh. Hey." }]);
+  const [input, setInput] = useState("");
+  const [rel, setRel] = useState(INIT_REL);
+  const [mem, setMem] = useState([]);
+  const [prefs, setPrefs] = useState(INIT_PREFS);
+  const [loading, setLoading] = useState(false);
+  const [openMenu, setOpenMenu] = useState(null);
+  const [openComplaint, setOpenComplaint] = useState(null);
+  const [editId, setEditId] = useState(null);
+  const [editText, setEditText] = useState("");
+  const [showStats, setShowStats] = useState(false);
+  const bottomRef = useRef(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [msgs, loading]);
+
+  function updateRel(intent, memEvents) {
+    setRel(prev => {
+      let { trust, friendship, romance, comfort } = prev;
+      const lv = relLevel(prev);
+      if (intent.isRude)  { trust = clamp(trust-8); friendship = clamp(friendship-5); comfort = clamp(comfort-3); }
+      if (intent.isKind)  { trust = clamp(trust+3); friendship = clamp(friendship+2); comfort = clamp(comfort+1); }
+      if (intent.isFlirt) { if (lv >= 65) romance = clamp(romance+4); else if (lv >= 30) romance = clamp(romance+1); }
+      comfort = clamp(comfort + 0.5);
+      friendship = clamp(friendship + 0.3);
+      return {
+        trust: Math.round(trust), friendship: Math.round(friendship),
+        romance: Math.round(romance), comfort: Math.round(comfort),
+      };
+    });
+    setMem(prev => {
+      let u = [...prev];
+      if (intent.isRude) u.push({ type: "rude_act", ts: Date.now() });
+      memEvents.forEach(e => { if (!u.find(m => m.type === e.type)) u.push({ ...e, ts: Date.now() }); });
+      return u;
+    });
+  }
+
+  async function callAPI(history, curRel, curMem, curPrefs) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        system: buildPrompt(curRel, curMem, curPrefs),
+        messages: history,
+      }),
+    });
+    const data = await res.json();
+    return data.content?.map(b => b.text || "").join("") || "...";
+  }
+
+  async function send(overrideText) {
+    const text = (overrideText ?? input).trim();
+    if (!text || loading) return;
+    const userMsg = { id: Date.now(), role: "user", content: text };
+    const next = [...msgs, userMsg];
+    setMsgs(next);
+    setInput("");
+    setLoading(true);
+    const intent = detectIntent(text);
+    const memEvts = extractMemory(text);
+    updateRel(intent, memEvts);
+    try {
+      const reply = await callAPI(next.map(m => ({ role: m.role, content: m.content })), rel, mem, prefs);
+      setMsgs(p => [...p, { id: Date.now()+1, role: "assistant", content: reply }]);
+    } catch {
+      setMsgs(p => [...p, { id: Date.now()+1, role: "assistant", content: "...(something went wrong)" }]);
+    }
+    setLoading(false);
+  }
+
+  async function regenerate(msgId) {
+    const idx = msgs.findIndex(m => m.id === msgId);
+    if (idx < 1) return;
+    setOpenMenu(null);
+    const prev = msgs.slice(0, idx);
+    setMsgs(prev);
+    setLoading(true);
+    try {
+      const reply = await callAPI(prev.map(m => ({ role: m.role, content: m.content })), rel, mem, prefs);
+      setMsgs([...prev, { id: Date.now(), role: "assistant", content: reply }]);
+    } catch {
+      setMsgs([...prev, { id: Date.now(), role: "assistant", content: "...(error)" }]);
+    }
+    setLoading(false);
+  }
+
+  function deleteMsg(id) {
+    setMsgs(p => p.filter(m => m.id !== id));
+    setOpenMenu(null);
+  }
+
+  function startEdit(msg) {
+    setEditId(msg.id);
+    setEditText(msg.content);
+    setOpenMenu(null);
+  }
+
+  async function submitEdit(msgId) {
+    const idx = msgs.findIndex(m => m.id === msgId);
+    const updated = msgs.map(m => m.id === msgId ? { ...m, content: editText } : m).slice(0, idx + 1);
+    setMsgs(updated);
+    setEditId(null);
+    setLoading(true);
+    updateRel(detectIntent(editText), extractMemory(editText));
+    try {
+      const reply = await callAPI(updated.map(m => ({ role: m.role, content: m.content })), rel, mem, prefs);
+      setMsgs([...updated, { id: Date.now(), role: "assistant", content: reply }]);
+    } catch {
+      setMsgs([...updated, { id: Date.now(), role: "assistant", content: "...(error)" }]);
+    }
+    setLoading(false);
+  }
+
+  function handleComplaint(type) {
+    setOpenComplaint(null);
+    if (type === "too_long")  setPrefs(p => ({ ...p, length: "short" }));
+    if (type === "too_short") setPrefs(p => ({ ...p, length: "long" }));
+    if (type === "rude")      setPrefs(p => ({ ...p, tone: "softer" }));
+    if (type === "ooc")       setPrefs(p => ({ ...p, strictness: Math.min(3, p.strictness + 1) }));
+  }
+
+  function resetChat() {
+    setMsgs([{ id: Date.now(), role: "assistant", content: "...oh. Hey." }]);
+    setRel(INIT_REL); setMem([]); setPrefs(INIT_PREFS);
+    setOpenMenu(null); setOpenComplaint(null); setEditId(null);
+  }
+
+  const lv = relLevel(rel);
+  const lvLabel = lv < 20 ? "Stranger" : lv < 40 ? "Acquaintance" : lv < 60 ? "Friend" : lv < 80 ? "Close Friend" : "Deeply Bonded";
+
+  return (
+    <div
+      style={{
+        fontFamily: "Georgia, serif",
+        background: "#0d0d0f",
+        height: "100vh",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        color: "#e8e0d5",
+        overflow: "hidden",
+      }}
+      onClick={() => { setOpenMenu(null); setOpenComplaint(null); }}
+    >
+      {/* HEADER */}
+      <div style={{
+        width: "100%", maxWidth: 600, flexShrink: 0,
+        background: "linear-gradient(180deg,#1a1520,#0d0d0f)",
+        borderBottom: "1px solid #2a2030",
+        padding: "14px 18px",
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{
+            width: 42, height: 42, borderRadius: "50%",
+            background: "linear-gradient(135deg,#7c5cbf,#c47fae)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 18, fontWeight: "bold", color: "#fff",
+            boxShadow: "0 0 14px #7c5cbf55", flexShrink: 0,
+          }}>A</div>
+          <div>
+            <div style={{ fontWeight: "bold", fontSize: 15 }}>Aiko</div>
+            <div style={{ fontSize: 11, color: "#9988aa" }}>{lvLabel} · Lv {lv}</div>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            onClick={e => { e.stopPropagation(); setShowStats(s => !s); }}
+            style={hdrBtnStyle}
+          >{showStats ? "✕" : "📊"}</button>
+          <button
+            onClick={e => { e.stopPropagation(); resetChat(); }}
+            style={hdrBtnStyle}
+          >↺</button>
+        </div>
+      </div>
+
+      {/* STATS */}
+      {showStats && (
+        <div style={{
+          width: "100%", maxWidth: 600, flexShrink: 0,
+          background: "#16111e", borderBottom: "1px solid #2a2030",
+          padding: "12px 18px",
+          display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10,
+        }}>
+          {[
+            ["Trust", rel.trust, "#7fc4e8"],
+            ["Friendship", rel.friendship, "#8ee8a0"],
+            ["Romance", rel.romance, "#e88ea0"],
+            ["Comfort", rel.comfort, "#e8c88e"],
+          ].map(([label, val, color]) => (
+            <div key={label}>
+              <div style={{ fontSize: 11, color: "#998aaa", marginBottom: 3 }}>{label}</div>
+              <div style={{ background: "#2a2030", borderRadius: 4, height: 5 }}>
+                <div style={{ width: `${val}%`, background: color, height: "100%", borderRadius: 4, transition: "width .5s" }} />
+              </div>
+              <div style={{ fontSize: 11, color, marginTop: 2 }}>{val}/100</div>
+            </div>
+          ))}
+          <div style={{ gridColumn: "1/-1", fontSize: 11, color: "#554466" }}>
+            Memory: {mem.length} events · Length: {prefs.length} · Tone: {prefs.tone}
+          </div>
+        </div>
+      )}
+
+      {/* MESSAGES */}
+      <div style={{
+        flex: 1, width: "100%", maxWidth: 600,
+        overflowY: "auto", padding: "16px 14px",
+        display: "flex", flexDirection: "column", gap: 14,
+      }}>
+        {msgs.map(msg => {
+          const isUser = msg.role === "user";
+          const menuOpen = openMenu === msg.id;
+          const complaintOpen = openComplaint === msg.id;
+          const isEditing = editId === msg.id;
+
+          return (
+            <div key={msg.id} style={{
+              display: "flex",
+              flexDirection: isUser ? "row-reverse" : "row",
+              alignItems: "flex-start",
+              gap: 8,
+            }}>
+              {/* Aiko avatar */}
+              {!isUser && (
+                <div style={{
+                  width: 28, height: 28, borderRadius: "50%",
+                  background: "linear-gradient(135deg,#7c5cbf,#c47fae)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 12, color: "#fff", flexShrink: 0, marginTop: 4,
+                }}>A</div>
+              )}
+
+              {/* Column: bubble + actions */}
+              <div style={{
+                maxWidth: "72%",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: isUser ? "flex-end" : "flex-start",
+                gap: 6,
+              }}>
+                {/* Edit mode */}
+                {isEditing ? (
+                  <>
+                    <textarea
+                      value={editText}
+                      onChange={e => setEditText(e.target.value)}
+                      onClick={e => e.stopPropagation()}
+                      style={{
+                        background: "#1e1828", border: "1px solid #7c5cbf",
+                        borderRadius: 12, color: "#e8e0d5",
+                        padding: "9px 12px", fontSize: 14, resize: "none",
+                        minHeight: 56, width: "220px", fontFamily: "Georgia,serif",
+                        outline: "none",
+                      }}
+                    />
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button
+                        onClick={e => { e.stopPropagation(); submitEdit(msg.id); }}
+                        style={{ background: "#7c5cbf", border: "none", borderRadius: 20, color: "#fff", padding: "5px 14px", fontSize: 12, cursor: "pointer" }}
+                      >Send</button>
+                      <button
+                        onClick={e => { e.stopPropagation(); setEditId(null); }}
+                        style={{ background: "#2a2030", border: "none", borderRadius: 20, color: "#998aaa", padding: "5px 14px", fontSize: 12, cursor: "pointer" }}
+                      >Cancel</button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    {/* Chat bubble */}
+                    <div
+                      onClick={e => {
+                        e.stopPropagation();
+                        if (openMenu === msg.id) {
+                          setOpenMenu(null);
+                          setOpenComplaint(null);
+                        } else {
+                          setOpenMenu(msg.id);
+                          setOpenComplaint(null);
+                        }
+                      }}
+                      style={{
+                        background: isUser
+                          ? "linear-gradient(135deg,#4a3560,#5c3a70)"
+                          : "#1e1828",
+                        border: isUser ? "none" : "1px solid #2a2030",
+                        borderRadius: isUser ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
+                        padding: "10px 14px",
+                        fontSize: 14, lineHeight: 1.55,
+                        color: "#e8e0d5",
+                        cursor: "pointer",
+                        userSelect: "none",
+                        boxShadow: isUser ? "0 2px 10px #4a356033" : "none",
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      {msg.content}
+                    </div>
+
+                    {/* Action pill row — below bubble */}
+                    {menuOpen && !complaintOpen && (
+                      <div
+                        onClick={e => e.stopPropagation()}
+                        style={{
+                          display: "flex", flexWrap: "wrap", gap: 5,
+                          justifyContent: isUser ? "flex-end" : "flex-start",
+                        }}
+                      >
+                        {isUser && (
+                          <Pill onClick={() => startEdit(msg)}>✏️ Edit</Pill>
+                        )}
+                        {!isUser && (
+                          <Pill onClick={() => regenerate(msg.id)}>🔄 Regen</Pill>
+                        )}
+                        {!isUser && (
+                          <Pill onClick={() => { setOpenComplaint(msg.id); setOpenMenu(null); }}>🚩 Report</Pill>
+                        )}
+                        <Pill danger onClick={() => deleteMsg(msg.id)}>🗑️ Delete</Pill>
+                        <Pill onClick={() => setOpenMenu(null)}>✕</Pill>
+                      </div>
+                    )}
+
+                    {/* Complaint pill row */}
+                    {complaintOpen && (
+                      <div
+                        onClick={e => e.stopPropagation()}
+                        style={{ display: "flex", flexDirection: "column", gap: 5, alignItems: isUser ? "flex-end" : "flex-start" }}
+                      >
+                        <div style={{ fontSize: 11, color: "#665577" }}>What's wrong?</div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                          <Pill onClick={() => handleComplaint("too_long")}>📏 Too long</Pill>
+                          <Pill onClick={() => handleComplaint("too_short")}>📐 Too short</Pill>
+                          <Pill onClick={() => handleComplaint("ooc")}>🎭 OOC</Pill>
+                          <Pill onClick={() => handleComplaint("rude")}>😤 Unpleasant</Pill>
+                          <Pill onClick={() => setOpenComplaint(null)}>✕</Pill>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          );
+        })}
+
+        {/* Typing dots */}
+        {loading && (
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+            <div style={{
+              width: 28, height: 28, borderRadius: "50%",
+              background: "linear-gradient(135deg,#7c5cbf,#c47fae)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 12, color: "#fff", flexShrink: 0, marginTop: 4,
+            }}>A</div>
+            <div style={{
+              background: "#1e1828", border: "1px solid #2a2030",
+              borderRadius: "18px 18px 18px 4px",
+              padding: "12px 16px", display: "flex", gap: 5, alignItems: "center",
+            }}>
+              {[0,1,2].map(i => (
+                <div key={i} style={{
+                  width: 6, height: 6, borderRadius: "50%", background: "#7c5cbf",
+                  animation: "blink 1.2s ease-in-out infinite",
+                  animationDelay: `${i * 0.2}s`,
+                }} />
+              ))}
+            </div>
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+
+      {/* INPUT */}
+      <div style={{
+        width: "100%", maxWidth: 600, flexShrink: 0,
+        padding: "10px 14px",
+        borderTop: "1px solid #1e1828",
+        background: "#0d0d0f",
+        display: "flex", gap: 8, alignItems: "flex-end",
+      }}>
+        <textarea
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onClick={e => e.stopPropagation()}
+          onKeyDown={e => {
+            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+          }}
+          placeholder="Say something..."
+          rows={1}
+          style={{
+            flex: 1, background: "#1a1520",
+            border: "1px solid #2a2030", borderRadius: 20,
+            color: "#e8e0d5", padding: "9px 15px",
+            fontSize: 14, resize: "none", outline: "none",
+            fontFamily: "Georgia,serif", lineHeight: 1.5,
+            maxHeight: 100, overflowY: "auto",
+          }}
+        />
+        <button
+          onClick={e => { e.stopPropagation(); send(); }}
+          disabled={loading || !input.trim()}
+          style={{
+            background: loading || !input.trim()
+              ? "#2a2030"
+              : "linear-gradient(135deg,#7c5cbf,#c47fae)",
+            border: "none", borderRadius: "50%",
+            width: 40, height: 40, color: "#fff", fontSize: 17,
+            cursor: loading || !input.trim() ? "not-allowed" : "pointer",
+            flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+            transition: "background .2s",
+          }}
+        >↑</button>
+      </div>
+
+      <style>{`
+        @keyframes blink {
+          0%,80%,100% { opacity:.2; transform:scale(.8); }
+          40% { opacity:1; transform:scale(1); }
+        }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #2a2030; border-radius: 4px; }
+      `}</style>
+    </div>
+  );
+}
+
+// ─── ATOMS ───────────────────────────────────────────────────────────────────
+const hdrBtnStyle = {
+  background: "transparent",
+  border: "1px solid #2a2030",
+  borderRadius: 8, color: "#998aaa",
+  padding: "5px 10px", cursor: "pointer", fontSize: 13,
+};
+
+function Pill({ children, onClick, danger }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: danger ? "#2a1520" : "#1a1528",
+        border: `1px solid ${danger ? "#5a2030" : "#2a2040"}`,
+        borderRadius: 20,
+        color: danger ? "#e87070" : "#9988bb",
+        padding: "4px 10px",
+        fontSize: 12, cursor: "pointer", whiteSpace: "nowrap",
+        fontFamily: "Georgia,serif",
+      }}
+    >{children}</button>
+  );
+}
